@@ -1,0 +1,27 @@
+# Build only the hotfixed application; keep the existing official runtime.
+FROM node:24-alpine AS frontend
+WORKDIR /src/frontend
+RUN corepack enable && corepack prepare pnpm@9 --activate
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY frontend/ ./
+COPY docs/legal/ /src/docs/legal/
+RUN pnpm run build
+
+FROM golang:1.26.5-alpine AS backend
+WORKDIR /src/backend
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+COPY backend/ ./
+RUN go test ./internal/pkg/apicompat
+COPY --from=frontend /src/backend/internal/web/dist ./internal/web/dist
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags embed \
+    -ldflags="-s -w -X main.Version=0.1.172-songta.1 -X main.BuildType=release" \
+    -trimpath -o /tmp/sub2api ./cmd/server
+
+# Exact production image recorded before this fix; database tooling, resources,
+# entrypoint, users and migrations retain the 0.1.172 implementation.
+FROM ghcr.io/wei-shaw/sub2api:0.1.172@sha256:22eeb8a26a75e92cab72488963605d4cd34edafcd164b34209c7140c9bcf457a
+COPY --from=backend --chown=sub2api:sub2api /tmp/sub2api /app/sub2api
