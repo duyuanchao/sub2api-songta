@@ -121,9 +121,10 @@ type ResponsesEventToChatState struct {
 	SentRole               bool
 	SawToolCall            bool
 	SawText                bool
-	Finalized              bool        // true after finish chunk has been emitted
-	NextToolCallIndex      int         // next sequential tool_call index to assign
-	OutputIndexToToolIndex map[int]int // Responses output_index → Chat tool_calls index
+	Finalized              bool           // true after finish chunk has been emitted
+	NextToolCallIndex      int            // next sequential tool_call index to assign
+	OutputIndexToToolIndex map[int]int    // Responses output_index → Chat tool_calls index
+	ToolArguments          map[int]string // parameter bytes already emitted per output_index
 	IncludeUsage           bool
 	Usage                  *ChatUsage
 }
@@ -134,12 +135,16 @@ func NewResponsesEventToChatState() *ResponsesEventToChatState {
 		ID:                     generateChatCmplID(),
 		Created:                time.Now().Unix(),
 		OutputIndexToToolIndex: make(map[int]int),
+		ToolArguments:          make(map[int]string),
 	}
 }
 
 // ResponsesEventToChatChunks converts a single Responses SSE event into zero
 // or more Chat Completions chunks, updating state as it goes.
 func ResponsesEventToChatChunks(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if state.Finalized {
+		return nil
+	}
 	switch evt.Type {
 	case "response.created":
 		return resToChatHandleCreated(evt, state)
@@ -147,11 +152,17 @@ func ResponsesEventToChatChunks(evt *ResponsesStreamEvent, state *ResponsesEvent
 		return resToChatHandleTextDelta(evt, state)
 	case "response.output_item.added":
 		return resToChatHandleOutputItemAdded(evt, state)
+	case "response.output_item.done":
+		return resToChatHandleOutputItemDone(evt, state)
 	case "response.function_call_arguments.delta",
 		// custom/freeform 工具（如新版 apply_patch）的输入增量与 function_call 参数增量同形，
 		// 均按 OutputIndex 累加到对应工具调用。
 		"response.custom_tool_call_input.delta":
 		return resToChatHandleFuncArgsDelta(evt, state)
+	case "response.function_call_arguments.done":
+		return resToChatCompleteToolArguments(evt.OutputIndex, evt.Arguments, state)
+	case "response.custom_tool_call_input.done":
+		return resToChatCompleteToolArguments(evt.OutputIndex, evt.Input, state)
 	case "response.reasoning_summary_text.delta",
 		// 原始推理文本增量（真实 Codex 客户端消费的 reasoning_text.delta），
 		// 与 reasoning summary 一样映射为 reasoning_content。
@@ -244,6 +255,9 @@ func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesE
 	if evt.Item == nil || (evt.Item.Type != "function_call" && evt.Item.Type != "custom_tool_call") {
 		return nil
 	}
+	if _, exists := state.OutputIndexToToolIndex[evt.OutputIndex]; exists {
+		return nil
+	}
 
 	state.SawToolCall = true
 	idx := state.NextToolCallIndex
@@ -271,6 +285,10 @@ func resToChatHandleFuncArgsDelta(evt *ResponsesStreamEvent, state *ResponsesEve
 	if !ok {
 		return nil
 	}
+	if state.ToolArguments == nil {
+		state.ToolArguments = make(map[int]string)
+	}
+	state.ToolArguments[evt.OutputIndex] += evt.Delta
 
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
 		ToolCalls: []ChatToolCall{{
@@ -282,6 +300,35 @@ func resToChatHandleFuncArgsDelta(evt *ResponsesStreamEvent, state *ResponsesEve
 	})}
 }
 
+// Completion events carry a full snapshot, not an additional delta. Some
+// upstreams emit no argument deltas at all. Only emit the missing suffix so
+// delta + done + item.done + response.completed cannot duplicate arguments.
+func resToChatCompleteToolArguments(outputIndex int, full string, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	emitted := state.ToolArguments[outputIndex]
+	if full == "" || !strings.HasPrefix(full, emitted) {
+		// Already streamed bytes cannot be retracted. Appending a conflicting
+		// snapshot would corrupt the call further.
+		return nil
+	}
+	return resToChatHandleFuncArgsDelta(&ResponsesStreamEvent{
+		OutputIndex: outputIndex,
+		Delta:       full[len(emitted):],
+	}, state)
+}
+
+func resToChatHandleOutputItemDone(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Item == nil || (evt.Item.Type != "function_call" && evt.Item.Type != "custom_tool_call") {
+		return nil
+	}
+	// Also handles upstreams that omit output_item.added.
+	chunks := resToChatHandleOutputItemAdded(evt, state)
+	full := evt.Item.Arguments
+	if evt.Item.Type == "custom_tool_call" {
+		full = evt.Item.Input
+	}
+	return append(chunks, resToChatCompleteToolArguments(evt.OutputIndex, full, state)...)
+}
+
 func resToChatHandleReasoningDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
 	if evt.Delta == "" {
 		return nil
@@ -291,6 +338,17 @@ func resToChatHandleReasoningDelta(evt *ResponsesStreamEvent, state *ResponsesEv
 }
 
 func resToChatHandleCompleted(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	var chunks []ChatCompletionsChunk
+	if evt.Response != nil && evt.Response.Status == "completed" {
+		// Last-resort snapshot fallback must precede the finish chunk. Indices
+		// refer to all output items, including reasoning/message items.
+		for outputIndex := range evt.Response.Output {
+			chunks = append(chunks, resToChatHandleOutputItemDone(&ResponsesStreamEvent{
+				OutputIndex: outputIndex,
+				Item:        &evt.Response.Output[outputIndex],
+			}, state)...)
+		}
+	}
 	state.Finalized = true
 	finishReason := "stop"
 
@@ -321,7 +379,6 @@ func resToChatHandleCompleted(evt *ResponsesStreamEvent, state *ResponsesEventTo
 		finishReason = "tool_calls"
 	}
 
-	var chunks []ChatCompletionsChunk
 	chunks = append(chunks, makeChatFinishChunk(state, finishReason))
 
 	if state.IncludeUsage && state.Usage != nil {
